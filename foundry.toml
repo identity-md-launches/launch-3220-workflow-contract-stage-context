@@ -1,0 +1,21 @@
+# bytecode_hash = "none": the launch compares deployed bytes without the metadata hash,
+# so the same source builds the same creation code in any directory.
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+bytecode_hash = "none"
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "judge/=lib/judge/src/",
+]
+
+[fuzz]
+runs = 256
