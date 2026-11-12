@@ -18,6 +18,19 @@
   },
   {
     "type": "function",
+    "name": "LAST_ASK_AT",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "QUESTION",
     "inputs": [],
     "outputs": [
@@ -174,6 +187,11 @@
             "internalType": "uint256"
           },
           {
+            "name": "pendingQuestions",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
             "name": "resolvedYes",
             "type": "bool",
             "internalType": "bool"
@@ -190,6 +208,11 @@
           },
           {
             "name": "bettingClosesAt",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "lastAskAt",
             "type": "uint256",
             "internalType": "uint256"
           },
@@ -225,6 +248,19 @@
   {
     "type": "function",
     "name": "noTotal",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "pendingQuestions",
     "inputs": [],
     "outputs": [
       {

@@ -30,6 +30,22 @@ contract ReentrantClaimer {
     }
 }
 
+/// @dev Bets YES and settles an already-decided question in one transaction, to take the pot without risk.
+contract SettleSniper {
+    GtaSixMarket private immutable market;
+
+    constructor(GtaSixMarket market_) {
+        market = market_;
+    }
+
+    function snipe(uint256 id) external payable {
+        market.betYes{value: msg.value}();
+        market.settle(id);
+    }
+
+    receive() external payable {}
+}
+
 /// @dev A contract with no `receive`, so a payout to it fails.
 contract NoReceive {
     function bet(GtaSixMarket market) external payable {
@@ -100,6 +116,8 @@ contract GtaSixMarketTest is Test, JudgedTest {
         assertEq(market.RESOLUTION_DEADLINE(), 1799366399, "2027-01-07T23:59:59Z");
         assertLt(market.BETTING_CLOSES_AT(), market.RESOLUTION_DEADLINE());
         assertEq(market.RESOLUTION_DEADLINE() - market.BETTING_CLOSES_AT(), 7 days);
+        assertEq(market.LAST_ASK_AT(), 1799279999, "2027-01-06T23:59:59Z");
+        assertEq(market.RESOLUTION_DEADLINE() - market.LAST_ASK_AT(), 1 days, "a question lives at most a day");
     }
 
     function test_questionIsAsciiAndWithinJudgeLimit() public view {
@@ -118,8 +136,10 @@ contract GtaSixMarketTest is Test, JudgedTest {
         assertEq(s.yesTotal, 0);
         assertEq(s.noTotal, 0);
         assertEq(s.questionCount, 0);
+        assertEq(s.pendingQuestions, 0);
         assertFalse(s.resolvedYes);
         assertEq(s.bettingClosesAt, market.BETTING_CLOSES_AT());
+        assertEq(s.lastAskAt, market.LAST_ASK_AT());
         assertEq(s.resolutionDeadline, market.RESOLUTION_DEADLINE());
         assertEq(market.pot(), 0);
         assertEq(market.claimable(alice), 0);
@@ -262,14 +282,36 @@ contract GtaSixMarketTest is Test, JudgedTest {
         market.resolve{value: QUESTION_FEE}("");
     }
 
-    function test_resolveAfterDeadlineReverts() public {
-        vm.warp(market.RESOLUTION_DEADLINE());
+    function test_resolveAfterLastAskReverts() public {
+        vm.warp(market.LAST_ASK_AT());
         _ask(); // the last second is still allowed
+        vm.warp(market.LAST_ASK_AT() + 1);
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.prank(asker);
+        vm.expectRevert(GtaSixMarket.ResolutionWindowOver.selector);
+        market.resolve{value: QUESTION_FEE}(PROOF);
+        // Still refused up to and past the resolution deadline: a question asked now could not be settled in time.
+        vm.warp(market.RESOLUTION_DEADLINE());
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.prank(asker);
+        vm.expectRevert(GtaSixMarket.ResolutionWindowOver.selector);
+        market.resolve{value: QUESTION_FEE}(PROOF);
         vm.warp(market.RESOLUTION_DEADLINE() + 1);
         vm.roll(vm.getBlockNumber() + 1);
         vm.prank(asker);
         vm.expectRevert(GtaSixMarket.ResolutionWindowOver.selector);
         market.resolve{value: QUESTION_FEE}(PROOF);
+    }
+
+    function test_questionAskedAtLastAskCanAlwaysBeSettledInTime() public {
+        // Asked at the last allowed second and left for the stand-in's full day: settling at the deadline works.
+        _betYes(alice, 1 ether);
+        vm.warp(market.LAST_ASK_AT());
+        uint256 id = _ask();
+        JudgeStandIn(JUDGE_STAND_IN).answer(id, JudgeStandIn.Verdict.Yes);
+        vm.warp(market.RESOLUTION_DEADLINE());
+        market.settle(id);
+        assertTrue(market.resolvedYes());
     }
 
     function test_resolveAfterYesReverts() public {
@@ -294,6 +336,134 @@ contract GtaSixMarketTest is Test, JudgedTest {
         uint256 b = _ask();
         assertEq(b, a + 1);
         assertEq(market.questionCount(), 2);
+        assertEq(market.pendingQuestions(), 2);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Betting is suspended while a question is pending
+    // ---------------------------------------------------------------------------------------------
+
+    function test_betWhileQuestionPendingReverts() public {
+        _betYes(alice, 1 ether);
+        _ask();
+        assertFalse(market.bettingOpen(), "a pending question suspends betting");
+        assertEq(uint8(market.phase()), uint8(GtaSixMarket.Phase.AwaitingResolution));
+        assertFalse(market.marketState().bettingOpen);
+        vm.prank(bob);
+        vm.expectRevert(GtaSixMarket.BettingClosed.selector);
+        market.betYes{value: 1 ether}();
+        vm.prank(bob);
+        vm.expectRevert(GtaSixMarket.BettingClosed.selector);
+        market.betNo{value: 1 ether}();
+        assertEq(market.pot(), 1 ether);
+    }
+
+    function test_betAfterVerdictIsReadableButBeforeSettleReverts() public {
+        _betYes(alice, 1 ether);
+        _betNo(bob, 9 ether);
+        _ask();
+        uint256 id = answerYes();
+        assertEq(uint8(JudgeStandIn(JUDGE_STAND_IN).verdict(id)), 1, "the verdict is public on the Judge");
+        assertFalse(market.resolvedYes());
+        vm.prank(carol);
+        vm.expectRevert(GtaSixMarket.BettingClosed.selector);
+        market.betYes{value: 100 ether}();
+        market.settle(id);
+        assertEq(market.claimable(alice), 10 ether, "the only YES bettor at risk takes the whole pot");
+    }
+
+    function test_atomicBetAndSettleAfterVerdictReverts() public {
+        _betYes(alice, 1 ether);
+        _betNo(bob, 9 ether);
+        _ask();
+        uint256 id = answerYes();
+        SettleSniper sniper = new SettleSniper(market);
+        vm.deal(address(this), 1000 ether);
+        vm.expectRevert(GtaSixMarket.BettingClosed.selector);
+        sniper.snipe{value: 1000 ether}(id);
+        assertFalse(market.resolvedYes(), "the failed snipe settled nothing");
+        market.settle(id);
+        assertTrue(market.resolvedYes());
+        assertEq(market.claimable(alice), 10 ether);
+        assertEq(market.claimable(address(sniper)), 0);
+        assertEq(market.yesTotal(), 1 ether);
+    }
+
+    function test_bettingReopensAfterNoVerdictIsSettled() public {
+        _betYes(alice, 1 ether);
+        _ask();
+        uint256 id = answerNo();
+        assertFalse(market.bettingOpen());
+        market.settle(id);
+        assertEq(market.pendingQuestions(), 0);
+        assertTrue(market.bettingOpen(), "a NO reopens betting");
+        assertEq(uint8(market.phase()), uint8(GtaSixMarket.Phase.Betting));
+        _betNo(bob, 2 ether);
+        assertEq(market.noTotal(), 2 ether);
+    }
+
+    function test_bettingReopensAfterNoAnswerIsSettled() public {
+        _betYes(alice, 1 ether);
+        uint256 id = _ask();
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1); // nobody answered: the question ended on its own
+        assertFalse(market.bettingOpen(), "still suspended until someone settles");
+        market.settle(id);
+        assertTrue(market.bettingOpen(), "a no-answer reopens betting");
+        _betNo(bob, 2 ether);
+        assertEq(market.noTotal(), 2 ether);
+    }
+
+    function test_bettingReopensOnlyWhenEveryPendingQuestionIsSettled() public {
+        uint256 first = _ask();
+        uint256 second = _ask();
+        JudgeStandIn(JUDGE_STAND_IN).answer(first, JudgeStandIn.Verdict.No);
+        JudgeStandIn(JUDGE_STAND_IN).answer(second, JudgeStandIn.Verdict.No);
+        vm.warp(vm.getBlockTimestamp() + 5 minutes);
+        market.settle(first);
+        assertEq(market.pendingQuestions(), 1);
+        assertFalse(market.bettingOpen(), "one question is still pending");
+        vm.prank(alice);
+        vm.expectRevert(GtaSixMarket.BettingClosed.selector);
+        market.betYes{value: 1 ether}();
+        market.settle(second);
+        assertEq(market.pendingQuestions(), 0);
+        assertTrue(market.bettingOpen());
+        _betYes(alice, 1 ether);
+    }
+
+    function test_bettingStaysClosedAfterCountedYes() public {
+        _betYes(alice, 1 ether);
+        _ask();
+        market.settle(answerYes());
+        assertEq(market.pendingQuestions(), 0);
+        assertFalse(market.bettingOpen(), "a counted YES closes betting for good");
+        vm.prank(bob);
+        vm.expectRevert(GtaSixMarket.BettingClosed.selector);
+        market.betNo{value: 1 ether}();
+    }
+
+    function testFuzz_betAcceptedOnlyWhenNothingIsPending(uint8 asks, uint8 settles) public {
+        asks = uint8(bound(asks, 0, 5));
+        settles = uint8(bound(settles, 0, asks));
+        uint256[] memory ids = new uint256[](asks);
+        for (uint256 i; i < asks; ++i) {
+            ids[i] = _ask();
+            JudgeStandIn(JUDGE_STAND_IN).answer(ids[i], JudgeStandIn.Verdict.No);
+        }
+        vm.warp(vm.getBlockTimestamp() + 5 minutes);
+        for (uint256 i; i < settles; ++i) {
+            market.settle(ids[i]);
+        }
+        assertEq(market.pendingQuestions(), asks - settles);
+        if (asks == settles) {
+            _betYes(alice, 1 ether);
+            assertEq(market.yesTotal(), 1 ether);
+        } else {
+            assertFalse(market.bettingOpen());
+            vm.prank(alice);
+            vm.expectRevert(GtaSixMarket.BettingClosed.selector);
+            market.betYes{value: 1 ether}();
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -408,10 +578,11 @@ contract GtaSixMarketTest is Test, JudgedTest {
     function test_yesSettledAfterDeadlineIsIgnoredAndNoWins() public {
         _betYes(alice, 1 ether);
         _betNo(bob, 1 ether);
-        vm.warp(market.RESOLUTION_DEADLINE() - 1 minutes);
+        vm.warp(market.LAST_ASK_AT());
         _ask();
         uint256 id = latestQuestion();
         JudgeStandIn(JUDGE_STAND_IN).answer(id, JudgeStandIn.Verdict.Yes);
+        // Nobody settled for a day: the verdict lands after the deadline.
         vm.warp(market.RESOLUTION_DEADLINE() + 1);
         vm.expectEmit(true, false, false, true, address(market));
         emit GtaSixMarket.QuestionSettled(id, 1, false);
@@ -428,7 +599,7 @@ contract GtaSixMarketTest is Test, JudgedTest {
 
     function test_yesSettledAtExactDeadlineCounts() public {
         _betYes(alice, 1 ether);
-        vm.warp(market.RESOLUTION_DEADLINE() - 10 minutes);
+        vm.warp(market.LAST_ASK_AT() - 10 minutes);
         _ask();
         uint256 id = latestQuestion();
         JudgeStandIn(JUDGE_STAND_IN).answer(id, JudgeStandIn.Verdict.Yes);

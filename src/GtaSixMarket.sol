@@ -15,6 +15,10 @@ import {Judged} from "judge/Judged.sol";
 /// landed by then, the NO side wins, with no further action from anyone. A NO or no-answer verdict decides
 /// nothing: anyone can get one with a bad proof, so only a YES ever moves the market.
 ///
+/// Betting is suspended while a question is pending (asked and not yet settled): the panel's verdict is
+/// readable on the Judge before anyone settles it, so a bet placed then would carry no risk. A NO or
+/// no-answer verdict reopens betting when settled; a counted YES closes it for good.
+///
 /// There is no owner, no fee, no pause and no upgrade. The only parties with any power are the bettors, the
 /// Judge panel and whoever pays to ask.
 contract GtaSixMarket is Judged {
@@ -25,9 +29,14 @@ contract GtaSixMarket is Judged {
     /// @notice Last second at which a bet is accepted: 2026-12-31 23:59:59 UTC, the end of the release window.
     uint256 public constant BETTING_CLOSES_AT = 1798761599;
 
-    /// @notice Last second at which a YES verdict counts, and at which `resolve` may still ask:
-    /// 2027-01-07 23:59:59 UTC. After it, if no YES has landed, the NO side has won.
+    /// @notice Last second at which a YES verdict counts: 2027-01-07 23:59:59 UTC. After it, if no YES has
+    /// landed, the NO side has won.
     uint256 public constant RESOLUTION_DEADLINE = 1799366399;
+
+    /// @notice Last second at which `resolve` may ask: 2027-01-06 23:59:59 UTC, one day before the
+    /// resolution deadline. A Judge question can take up to a day to end, so a question asked later than
+    /// this could never be settled in time and its fee would be wasted.
+    uint256 public constant LAST_ASK_AT = RESOLUTION_DEADLINE - 1 days;
 
     /// @notice The question put to the Judge panel. ASCII, under 500 bytes, and fixed so that nothing a caller
     /// writes can reach the part the panel trusts. The caller's evidence goes in the proof.
@@ -41,7 +50,7 @@ contract GtaSixMarket is Judged {
     /// @notice Where the market stands right now.
     enum Phase {
         Betting, // bets are accepted
-        AwaitingResolution, // betting closed, a YES verdict can still land
+        AwaitingResolution, // betting closed or suspended, a YES verdict can still land
         YesWon, // a YES verdict landed in time: YES bettors claim
         NoWon // the resolution deadline passed with no YES: NO bettors claim
     }
@@ -64,6 +73,9 @@ contract GtaSixMarket is Judged {
 
     /// @notice Every Judge question this contract has asked, in order.
     uint256[] private _questionIds;
+    /// @notice How many asked questions have not been settled yet. Betting is suspended while this is
+    /// non-zero, because a verdict is readable on the Judge before it is settled here.
+    uint256 public pendingQuestions;
     /// @notice Who asked each question.
     mapping(uint256 id => address) public askedBy;
     /// @notice When each question was asked.
@@ -130,13 +142,15 @@ contract GtaSixMarket is Judged {
     /// @notice Ask the Judge panel whether the game is out, attaching `proof` (ASCII, at most 650 bytes:
     /// a link to the announcement or news report). Send about 0.002 ETH to pay for the question; what it
     /// did not cost comes straight back. Anyone may ask, any number of times, until the market resolves
-    /// YES or the resolution deadline passes. The id is in the `Asked` and `ResolutionAsked` events.
+    /// YES or `LAST_ASK_AT` passes. The id is in the `Asked` and `ResolutionAsked` events. Betting is
+    /// suspended from this call until the question is settled.
     /// @dev A caller that is a contract takes its change inside this call and must have a `receive`.
     function resolve(string calldata proof) external payable returns (uint256 id) {
         if (resolvedYes) revert AlreadyResolved();
-        if (block.timestamp > RESOLUTION_DEADLINE) revert ResolutionWindowOver();
+        if (block.timestamp > LAST_ASK_AT) revert ResolutionWindowOver();
         id = ask(QUESTION, proof);
         _questionIds.push(id);
+        pendingQuestions += 1;
         askedBy[id] = msg.sender;
         askedAt[id] = block.timestamp;
         emit ResolutionAsked(id, msg.sender, proof);
@@ -144,7 +158,7 @@ contract GtaSixMarket is Judged {
 
     /// @dev The panel said yes. It counts only once, and only on or before the resolution deadline.
     function onYes(uint256 id) internal override {
-        verdictOf[id] = 1;
+        _settled(id, 1);
         bool counted = !resolvedYes && block.timestamp <= RESOLUTION_DEADLINE;
         emit QuestionSettled(id, 1, counted);
         if (counted) {
@@ -155,16 +169,24 @@ contract GtaSixMarket is Judged {
         }
     }
 
-    /// @dev The panel said this proof did not show a release. Nothing changes: ask again with better proof.
+    /// @dev The panel said this proof did not show a release. Nothing changes but betting reopens: ask
+    /// again with better proof.
     function onNo(uint256 id) internal override {
-        verdictOf[id] = 2;
+        _settled(id, 2);
         emit QuestionSettled(id, 2, false);
     }
 
-    /// @dev No decision: refused, split, or a day passed. Nothing changes: ask again.
+    /// @dev No decision: refused, split, or a day passed. Nothing changes but betting reopens: ask again.
     function onNoAnswer(uint256 id) internal override {
-        verdictOf[id] = 3;
+        _settled(id, 3);
         emit QuestionSettled(id, 3, false);
+    }
+
+    /// @dev Records a verdict and takes the question out of the pending count. `Judged.settle` runs each
+    /// question's hook exactly once, so the count never goes below zero.
+    function _settled(uint256 id, uint8 verdict) private {
+        verdictOf[id] = verdict;
+        pendingQuestions -= 1;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -212,16 +234,17 @@ contract GtaSixMarket is Judged {
     // Views for the site
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Whether a bet would be accepted right now.
+    /// @notice Whether a bet would be accepted right now: no counted YES, no question pending, and the
+    /// betting window still open.
     function bettingOpen() public view returns (bool) {
-        return !resolvedYes && block.timestamp <= BETTING_CLOSES_AT;
+        return !resolvedYes && pendingQuestions == 0 && block.timestamp <= BETTING_CLOSES_AT;
     }
 
     /// @notice Where the market stands right now.
     function phase() public view returns (Phase) {
         if (resolvedYes) return Phase.YesWon;
         if (block.timestamp > RESOLUTION_DEADLINE) return Phase.NoWon;
-        if (block.timestamp <= BETTING_CLOSES_AT) return Phase.Betting;
+        if (bettingOpen()) return Phase.Betting;
         return Phase.AwaitingResolution;
     }
 
@@ -248,10 +271,12 @@ contract GtaSixMarket is Judged {
         uint256 noTotal;
         uint256 totalClaimed;
         uint256 questionCount;
+        uint256 pendingQuestions;
         bool resolvedYes;
         uint256 resolvedAt;
         uint256 winningQuestionId;
         uint256 bettingClosesAt;
+        uint256 lastAskAt;
         uint256 resolutionDeadline;
     }
 
@@ -262,10 +287,12 @@ contract GtaSixMarket is Judged {
         s.noTotal = noTotal;
         s.totalClaimed = totalClaimed;
         s.questionCount = _questionIds.length;
+        s.pendingQuestions = pendingQuestions;
         s.resolvedYes = resolvedYes;
         s.resolvedAt = resolvedAt;
         s.winningQuestionId = winningQuestionId;
         s.bettingClosesAt = BETTING_CLOSES_AT;
+        s.lastAskAt = LAST_ASK_AT;
         s.resolutionDeadline = RESOLUTION_DEADLINE;
     }
 
