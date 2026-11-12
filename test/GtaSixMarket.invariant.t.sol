@@ -109,6 +109,12 @@ contract GtaSixMarketInvariantTest is Test, JudgedTest {
         uint256 count = handler.questionLength();
         uint256[] memory ids = market.questionIds();
         assertEq(market.questionCount(), count);
+        uint256 unsettled;
+        for (uint256 i; i < count; ++i) {
+            if (!handler.question(i).settled) ++unsettled;
+        }
+        assertEq(unsettled, handler.pending());
+        assertEq(market.pendingQuestions(), unsettled, "pending count differs from unsettled questions");
         assertEq(ids.length, count);
         for (uint256 i; i < count; ++i) {
             GtaSixMarketHandler.Question memory q = handler.question(i);
@@ -122,6 +128,7 @@ contract GtaSixMarketInvariantTest is Test, JudgedTest {
         if (handler.yesWon()) expected = GtaSixMarket.Phase.YesWon;
         else if (vm.getBlockTimestamp() > market.RESOLUTION_DEADLINE()) expected = GtaSixMarket.Phase.NoWon;
         else if (vm.getBlockTimestamp() > market.BETTING_CLOSES_AT()) expected = GtaSixMarket.Phase.AwaitingResolution;
+        else if (handler.pending() != 0) expected = GtaSixMarket.Phase.AwaitingResolution;
         else expected = GtaSixMarket.Phase.Betting;
         assertEq(uint256(market.phase()), uint256(expected));
         GtaSixMarket.MarketState memory s = market.marketState();
@@ -132,6 +139,8 @@ contract GtaSixMarketInvariantTest is Test, JudgedTest {
         assertEq(s.noTotal, handler.noDeposited());
         assertEq(s.totalClaimed, handler.paidOut());
         assertEq(s.questionCount, count);
+        assertEq(s.pendingQuestions, unsettled);
+        assertEq(s.lastAskAt, market.LAST_ASK_AT());
         assertEq(s.resolvedYes, handler.yesWon());
         assertEq(s.resolvedAt, handler.winningTime());
         assertEq(s.winningQuestionId, handler.winningId());
@@ -170,9 +179,39 @@ contract GtaSixMarketInvariantTest is Test, JudgedTest {
         invariant_ethAndHistoricalTotalsAreConserved();
     }
 
+    function test_handlerSuspendsBettingUntilEveryPendingQuestionSettles() public {
+        // setUp left two questions pending: a bet is refused, even once one has a readable verdict.
+        handler.bet(0, 1 ether + 3, true);
+        handler.answer(0, 2);
+        handler.settle(0, 1);
+        handler.bet(0, 1 ether + 3, true);
+        assertEq(handler.suspendedBetRejections(), 2);
+        assertEq(handler.pending(), 1);
+        handler.answer(1, 3);
+        handler.settle(1, 1);
+        assertEq(handler.pending(), 0);
+        uint256 before = handler.betCalls();
+        handler.bet(0, 1 ether + 3, true);
+        assertEq(handler.betCalls(), before + 1, "betting reopened");
+        invariant_actionsMeetTheirPreconditionsAndPostconditions();
+        invariant_resolutionAndQuestionHistoryMatchIndependentModel();
+    }
+
+    function test_handlerRejectsAsksAfterLastAskAt() public {
+        handler.advanceTime(0, 4 << 2);
+        uint256 asked = handler.askCalls();
+        handler.ask(0);
+        assertEq(handler.askCalls(), asked + 1, "the last second still asks");
+        handler.advanceTime(0, 5 << 2);
+        handler.ask(1);
+        assertEq(handler.askCalls(), asked + 1, "one second later is refused");
+        invariant_actionsMeetTheirPreconditionsAndPostconditions();
+        invariant_resolutionAndQuestionHistoryMatchIndependentModel();
+    }
+
     function test_handlerCanReachTimeoutAndRejectLateYes() public {
         handler.answer(0, 1);
-        handler.advanceTime(0, 3);
+        handler.advanceTime(0, 3 << 2);
         handler.claim(2);
         handler.settle(0, 4);
         handler.claim(3);

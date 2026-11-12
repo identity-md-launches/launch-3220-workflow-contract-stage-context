@@ -32,6 +32,8 @@ contract GtaSixMarketHandler is Test {
     uint256 public askCalls;
     uint256 public settlementCalls;
     uint256 public claimCalls;
+    uint256 public pending;
+    uint256 public suspendedBetRejections;
     bytes32 public firstFailure;
 
     bool public yesWon;
@@ -67,7 +69,9 @@ contract GtaSixMarketHandler is Test {
         else if (amountSeed % 4 == 1 && actor.balance != 0) amount = 1;
         else if (amountSeed % 4 == 2) amount = actor.balance;
 
-        bool open = !yesWon && vm.getBlockTimestamp() <= market.BETTING_CLOSES_AT();
+        // Betting needs no counted YES, no asked-but-unsettled question, and the window still open.
+        bool inWindow = !yesWon && vm.getBlockTimestamp() <= market.BETTING_CLOSES_AT();
+        bool open = inWindow && pending == 0;
         vm.prank(actor);
         (bool ok, bytes memory data) = address(market).call{value: amount}(
             yes ? abi.encodeCall(market.betYes, ()) : abi.encodeCall(market.betNo, ())
@@ -83,6 +87,7 @@ contract GtaSixMarketHandler is Test {
             }
             ++betCalls;
         } else {
+            if (amount != 0 && inWindow) ++suspendedBetRejections;
             _check(
                 keccak256(data)
                     == keccak256(
@@ -100,9 +105,12 @@ contract GtaSixMarketHandler is Test {
         uint256 index = actorSeed % ACTORS;
         address actor = actors[index];
         if (actor.balance < FEE) return;
+        // Pile-ups of three or more pending questions stay reachable, but rarer, so sequences also
+        // reach the state where every question is settled and betting has reopened.
+        if (pending >= 2 && (actorSeed >> 8) % 4 != 0) return;
         // A new transaction in a new block avoids the library's same-sender/value block guard.
         vm.roll(vm.getBlockNumber() + 1);
-        bool allowed = !yesWon && vm.getBlockTimestamp() <= market.RESOLUTION_DEADLINE();
+        bool allowed = !yesWon && vm.getBlockTimestamp() <= market.LAST_ASK_AT();
         uint256 balanceBefore = address(market).balance;
         vm.prank(actor);
         (bool ok, bytes memory data) = address(market).call{value: FEE}(abi.encodeCall(market.resolve, (PROOF)));
@@ -112,6 +120,7 @@ contract GtaSixMarketHandler is Test {
             questions.push(Question(id, actor, vm.getBlockTimestamp(), 0, 0, false));
             fees[index] += COST;
             ++askCalls;
+            ++pending;
         } else {
             _check(
                 keccak256(data)
@@ -129,7 +138,7 @@ contract GtaSixMarketHandler is Test {
 
     function answer(uint256 questionSeed, uint256 answerSeed) external {
         if (questions.length == 0) return;
-        Question storage q = questions[questionSeed % questions.length];
+        Question storage q = questions[_pick(questionSeed)];
         if (q.answer != 0 || vm.getBlockTimestamp() > q.time + 1 days) return;
         uint8 verdict = uint8(bound(answerSeed, 1, 3));
         JudgeStandIn(JUDGE_STAND_IN).answer(q.id, JudgeStandIn.Verdict(verdict));
@@ -138,7 +147,7 @@ contract GtaSixMarketHandler is Test {
 
     function settle(uint256 questionSeed, uint256 callerSeed) external {
         if (questions.length == 0) return;
-        Question storage q = questions[questionSeed % questions.length];
+        Question storage q = questions[_pick(questionSeed)];
         uint8 verdict = q.answer;
         if (verdict == 0 && vm.getBlockTimestamp() > q.time + 1 days) verdict = 3;
         bool wasSettled = q.settled;
@@ -150,6 +159,7 @@ contract GtaSixMarketHandler is Test {
             q.settled = true;
             q.delivered = verdict;
             ++settlementCalls;
+            --pending;
             if (verdict == 1 && !yesWon && vm.getBlockTimestamp() <= market.RESOLUTION_DEADLINE()) {
                 yesWon = true;
                 winningId = q.id;
@@ -208,12 +218,16 @@ contract GtaSixMarketHandler is Test {
 
     function advanceTime(uint256 secondsSeed, uint256 boundarySeed) external {
         uint256 now_ = vm.getBlockTimestamp();
-        uint256 choice = boundarySeed % 5;
+        // One advance in four jumps to an exact boundary; the rest step up to 12 hours, so sequences
+        // spend long enough inside the betting window for suspended betting to reopen.
+        uint256 choice = boundarySeed % 4 == 0 ? (boundarySeed >> 2) % 6 : 6;
         uint256 next;
         if (choice == 0) next = market.BETTING_CLOSES_AT();
         else if (choice == 1) next = market.BETTING_CLOSES_AT() + 1;
         else if (choice == 2) next = market.RESOLUTION_DEADLINE();
         else if (choice == 3) next = market.RESOLUTION_DEADLINE() + 1;
+        else if (choice == 4) next = market.LAST_ASK_AT();
+        else if (choice == 5) next = market.LAST_ASK_AT() + 1;
         else next = now_ + bound(secondsSeed, 0, 12 hours);
         if (next > now_) vm.warp(next);
         vm.roll(vm.getBlockNumber() + 1);
@@ -239,6 +253,20 @@ contract GtaSixMarketHandler is Test {
         donated += amount;
     }
 
+    /// @dev One pick in four is uniform, so settled questions are retried (a failure path). The rest go to
+    /// the first unsettled question from a random start, so pending questions get answered and settled and
+    /// betting actually reopens within a sequence.
+    function _pick(uint256 seed) internal view returns (uint256) {
+        uint256 n = questions.length;
+        uint256 start = (seed >> 2) % n;
+        if (seed % 4 == 0) return start;
+        for (uint256 i; i < n; ++i) {
+            uint256 j = (start + i) % n;
+            if (!questions[j].settled) return j;
+        }
+        return start;
+    }
+
     function questionLength() external view returns (uint256) {
         return questions.length;
     }
@@ -251,9 +279,16 @@ contract GtaSixMarketHandler is Test {
         if (!condition && firstFailure == bytes32(0)) firstFailure = reason;
     }
 
+    /// @dev Betting and AwaitingResolution may alternate while questions are asked and settled before
+    /// the window closes. A final phase (YesWon, NoWon) never changes, Betting never follows the close,
+    /// and nothing returns to an earlier phase once the window has closed.
     function _checkPhase() internal {
         uint256 current = uint256(market.phase());
-        _check(current >= highestPhase, "phase regressed");
-        highestPhase = current;
+        if (highestPhase >= uint256(GtaSixMarket.Phase.YesWon)) _check(current == highestPhase, "final phase changed");
+        if (vm.getBlockTimestamp() > market.BETTING_CLOSES_AT()) {
+            _check(current != uint256(GtaSixMarket.Phase.Betting), "betting after close");
+            _check(current >= highestPhase, "phase regressed");
+        }
+        if (current > highestPhase || vm.getBlockTimestamp() <= market.BETTING_CLOSES_AT()) highestPhase = current;
     }
 }

@@ -35,6 +35,24 @@ particular, an outstanding question **can** be settled from a claim callback, bu
 it cannot replace the winning question or change payouts. The old unit test that
 only exercised an ordinary claim was renamed to describe what it actually checks.
 
+## Betting suspension and the ask window
+
+The revised implementation suspends betting while any question is pending, and refuses
+`resolve` after `LAST_ASK_AT` (one day before `RESOLUTION_DEADLINE`).
+`GtaSixMarket.suspension.t.sol` covers:
+
+- settling and betting in one transaction: allowed after a NO verdict, rolled back after a YES
+  verdict, and refused once the window has closed;
+- a pending question at the deadline, which does not block the NO outcome or claims, and is
+  recorded but not counted when settled late;
+- leftover questions after a counted YES;
+- an unanswered question staying pending for exactly one day;
+- a double settle, which cannot underflow the pending count;
+- refused asks from `LAST_ASK_AT + 1` onward;
+- a fuzz property that a question asked anywhere in the window and answered YES at any
+  point in its life always counts when settled straight away. This is the reason
+  `LAST_ASK_AT` exists.
+
 ## Stateful harness
 
 `GtaSixMarket.invariant.t.sol` uses 256 runs with depth 96, configured inline. Only
@@ -42,6 +60,15 @@ the eight action selectors on `handlers/GtaSixMarketHandler.sol` are targeted.
 The market and Judge are never arbitrary fuzz targets. Six funded actors make
 bets, ask questions, provide simulated oracle answers, settle, claim, attempt
 direct deposits, advance time, and introduce unsolicited ETH.
+
+The handler's model includes the pending-question count. A bet must succeed exactly when
+there is no counted YES, no unsettled question and the window is open. An ask must succeed
+exactly up to `LAST_ASK_AT`. `pendingQuestions` must equal the unsettled questions in the
+model. Betting and AwaitingResolution may alternate before the close. YesWon and NoWon never
+change, and nothing goes back to Betting after the close. `answer` and `settle` mostly target
+unsettled questions, and `ask` rarely piles up three or more pending questions. Without this,
+random sequences almost never reached a reopened market and a bet in it. A scratch campaign
+(not delivered) confirmed both states are now reached with the verifier seed.
 
 Deposits and two pending questions are seeded through the handler so an early
 deadline jump cannot leave a meaningless empty-pot campaign. Zero, one wei, full
@@ -74,4 +101,7 @@ is test code, not an application contract.
   The tests exercise those implemented boundaries; they cannot establish whether
   those date interpretations or the economics of betting after a release is known
   match a requester's unstated intent.
+- Open findings are in `.imd-findings.json`: anyone can suspend betting (including the last
+  minutes) for one question fee, and a contract asker can bet its change from inside
+  `resolve` before the question counts as pending. Neither is asserted as correct here.
 - Passing tests establish the properties exercised, not an absence of all defects.
