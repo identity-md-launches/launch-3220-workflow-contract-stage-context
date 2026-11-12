@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "GtaSixMarket",
+      "constructorArgs": []
+    }
+  ],
+  "notes": "GtaSixMarket is an ownerless ETH prediction market with no constructor arguments, deployment funding or initialization calls. The accepted implementation uses an inclusive release cutoff of 2026-12-31 23:59:59 UTC; betting remains open through that cutoff unless YES resolves earlier. A Judge YES verdict settled by 2027-01-07 23:59:59 UTC makes YES win; otherwise NO wins after that deadline. Winners claim proportional shares of the staked ETH; if nobody backed the winning side, bettors reclaim their stakes. Judge and its ETH payment door are existing external services whose Ethereum addresses are compiled into the inherited Judged code; they are not deployed by this manifest. The market has no admin, fee, pause or upgrade role."
+}
