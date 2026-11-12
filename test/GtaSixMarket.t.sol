@@ -569,7 +569,7 @@ contract GtaSixMarketTest is Test, JudgedTest {
         assertEq(address(market).balance, 2 ether);
     }
 
-    function test_settleCannotBeReenteredDuringPayout() public {
+    function test_honestClaimSucceedsAfterSettlement() public {
         // `claim` runs outside `settle`, so the Judged busy flag never blocks an honest claim.
         _betYes(alice, 1 ether);
         _ask();
